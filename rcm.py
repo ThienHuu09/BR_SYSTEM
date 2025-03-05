@@ -4,7 +4,7 @@ import logging
 import numpy as np
 from whoosh.index import create_in, open_dir
 from whoosh.fields import Schema, TEXT, NUMERIC
-from whoosh.qparser import MultifieldParser
+from whoosh.qparser import MultifieldParser, QueryParser
 from diskcache import Cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import ollama
@@ -49,7 +49,7 @@ def create_or_open_index(books_df):
                 title=str(row['title']),
                 authors=str(row['authors']),
                 published_year=int(row['published_year']) if pd.notna(row['published_year']) else 0,
-                category=str(row['categories']),
+                category=str(row['category']),
                 description=str(row['description']),
                 thumbnail=str(row['thumbnail'] if pd.notna(row['thumbnail']) else ''),
                 ratings_count=float(row['ratings_count']) if pd.notna(row['ratings_count']) else 0
@@ -74,45 +74,64 @@ def load_data():
             logger.error("File 'books.csv' not found")
             st.error("Không tìm thấy file 'books.csv'. Vui lòng kiểm tra lại.")
             return pd.DataFrame()
-        books_df = pd.read_csv('books.csv', usecols=[
-            'title', 'description', 'authors', 'categories',
-            'published_year', 'ratings_count', 'thumbnail'
-        ], dtype={
+        # Đọc file mà không chỉ định usecols để kiểm tra tất cả cột
+        books_df = pd.read_csv('books.csv', dtype={
             'title': 'string', 'description': 'string', 'authors': 'string',
-            'categories': 'string', 'published_year': 'Int32',
-            'ratings_count': 'float32', 'thumbnail': 'string'
+            'published_year': 'Int32', 'ratings_count': 'float32', 'thumbnail': 'string'
         })
+        # Kiểm tra các cột có trong file
+        expected_columns = {'title', 'description', 'authors', 'published_year', 'ratings_count', 'thumbnail'}
+        missing_columns = expected_columns - set(books_df.columns)
+        if missing_columns:
+            logger.error(f"Missing columns in books.csv: {missing_columns}")
+            st.error(f"File 'books.csv' thiếu các cột: {missing_columns}")
+            return pd.DataFrame()
+        # Kiểm tra cột category
+        if 'category' not in books_df.columns:
+            logger.warning("Column 'category' not found, adding empty category")
+            books_df['category'] = 'None'
+        else:
+            logger.debug(f"Found column 'category' with values: {books_df['category'].head()}")
+
         books_df.fillna({
             'description': 'None', 'authors': 'None',
-            'categories': 'None', 'thumbnail': ''
+            'category': 'None', 'thumbnail': ''
         }, inplace=True)
         books_df['ratings_count'] = books_df['ratings_count'].fillna(0)
+        # Thay thế chuỗi rỗng bằng khoảng trắng để tránh lỗi vector hóa
+        books_df['category'] = books_df['category'].replace('', ' ')
         logger.info(f"Loaded dataset with {len(books_df)} books")
         return books_df
     except Exception as e:
-        logger.error(f"Error loading data: {e}")
-        st.error("Không thể tải dữ liệu sách")
+        logger.error(f"Error loading data: {str(e)}")
+        st.error(f"Không thể tải dữ liệu sách: {str(e)}")
         return pd.DataFrame()
 
 @st.cache_resource
 def compute_similarity(df):
     try:
-        vectorizer = TfidfVectorizer(stop_words='english', max_features=5000,
-                                   max_df=1.0, min_df=1)  # Điều chỉnh max_df và min_df
-        combined_features = df['title'] + ' ' + df['description']
+        # Đảm bảo tất cả cột là chuỗi và không chứa giá trị không hợp lệ
+        combined_features = (df['title'].astype(str).replace('', ' ') + ' ' +
+                            df['description'].astype(str).replace('', ' ') + ' ' +
+                            df['category'].astype(str).replace('', ' ') + ' ' +
+                            df['authors'].astype(str).replace('', ' '))
+        vectorizer = TfidfVectorizer(stop_words='english', max_features=5000, max_df=1.0, min_df=1)
         tfidf_matrix = vectorizer.fit_transform(combined_features)
         sparse_tfidf = csr_matrix(tfidf_matrix)
         similarity_matrix = cosine_similarity(sparse_tfidf)
+        logger.debug(f"Similarity matrix shape: {similarity_matrix.shape}, df shape: {df.shape[0]}")
+        if similarity_matrix.shape[0] != df.shape[0]:
+            logger.warning(f"Similarity matrix size ({similarity_matrix.shape[0]}) does not match df size ({df.shape[0]})")
         return similarity_matrix
     except Exception as e:
-        logger.error(f"Error computing similarity: {e}")
+        logger.error(f"Error computing similarity: {str(e)}")
         return None
 
 @st.cache_data
 def mistral_search(query):
     try:
         future = executor.submit(ollama.chat, model="mistral", messages=[
-            {"role": "system", "content": "You are a book recommendation assistant. Only return titles that are highly relevant to the query based on scientific or factual content."},
+            {"role": "system", "content": "You are a book recommendation assistant. Only return titles that are highly relevant to the query based on scientific or factual content, authors, or publication years."},
             {"role": "user", "content": f"Find relevant book titles for: {query}"}
         ])
         response = future.result(timeout=10)
@@ -126,48 +145,68 @@ def mistral_search(query):
 
 def get_recommendations(query, similarity_matrix, books_df, ix):
     try:
-        # Tìm kiếm với Whoosh trên nhiều trường
+        # Tìm kiếm với Whoosh trên nhiều trường bao gồm authors và published_year
         with ix.searcher() as searcher:
-            parser = MultifieldParser(["title", "description", "category"], schema=schema)  # Thêm category
-            q = parser.parse(query)
-            results = searcher.search(q, limit=5)  # Tăng limit để lấy nhiều kết quả hơn
-            logger.debug(f"Whoosh results for '{query}': {len(results)} matches")
-            if results:
-                whoosh_results = []
-                for r in results:
-                    match = books_df[books_df['title'].str.lower() == r['title'].lower()]
-                    book_data = match.iloc[0].to_dict() if not match.empty else {
-                        'title': r['title'],
-                        'description': r['description'],
-                        'authors': r.get('authors', 'None'),
-                        'published_year': r.get('published_year', 0),
-                        'category': r.get('category', 'None'),
-                        'thumbnail': r.get('thumbnail', ''),
-                        'ratings_count': r.get('ratings_count', 0)
-                    }
-                    # Kiểm tra nếu từ khóa xuất hiện trong description hoặc category
-                    if query.lower() in (book_data['description'].lower() if book_data['description'] else '') or \
-                       query.lower() in (book_data['category'].lower() if book_data['category'] else ''):
-                        whoosh_results.append(book_data)
-                if whoosh_results:
-                    return pd.DataFrame(whoosh_results)
+            # Tìm kiếm chung trên các trường text
+            text_parser = MultifieldParser(["title", "description", "category", "authors"], schema=schema)
+            text_q = text_parser.parse(query)
+            text_results = searcher.search(text_q, limit=10)
+            logger.debug(f"Whoosh text results for '{query}': {len(text_results)} matches")
+
+            # Tìm kiếm riêng cho published_year
+            year_parser = QueryParser("published_year", schema=schema)
+            try:
+                year_value = int(query)  # Thử chuyển query thành số
+                year_q = year_parser.parse(str(year_value))
+                year_results = searcher.search(year_q, limit=10)
+                logger.debug(f"Whoosh year results for '{query}': {len(year_results)} matches")
+            except ValueError:
+                year_results = []  # Nếu không phải số, bỏ qua
+
+            # Kết hợp kết quả
+            whoosh_results = set()
+            for r in text_results:
+                match = books_df[books_df['title'].str.lower() == r['title'].lower()]
+                if not match.empty:
+                    whoosh_results.add(match.index[0])
+            for r in year_results:
+                match = books_df[books_df['title'].str.lower() == r['title'].lower()]
+                if not match.empty:
+                    whoosh_results.add(match.index[0])
+
+            if whoosh_results:
+                whoosh_results_df = books_df.loc[list(whoosh_results)]
+                logger.debug(f"Combined Whoosh results: {len(whoosh_results_df)} books")
+                return whoosh_results_df
 
         # Nếu không tìm thấy, dùng TF-IDF với kiểm tra liên quan
         vectorizer = TfidfVectorizer(stop_words='english', max_features=5000, max_df=1.0, min_df=1)
-        combined_features = books_df['title'] + ' ' + books_df['description'] + ' ' + books_df['category']
-        tfidf_matrix_query = vectorizer.fit_transform([query])  # Vectorize query
+        combined_features = (books_df['title'].astype(str).replace('', ' ') + ' ' +
+                            books_df['description'].astype(str).replace('', ' ') + ' ' +
+                            books_df['category'].astype(str).replace('', ' ') + ' ' +
+                            books_df['authors'].astype(str).replace('', ' '))
+        tfidf_matrix_query = vectorizer.fit_transform([query])
         tfidf_matrix_books = vectorizer.transform(combined_features)
         logger.debug(f"TF-IDF matrix shape: {tfidf_matrix_books.shape}")
         similarity_scores = cosine_similarity(tfidf_matrix_query, tfidf_matrix_books).flatten()
         logger.debug(f"Similarity scores shape: {similarity_scores.shape}")
 
-        # Lọc các sách có độ tương đồng cơ bản (>= 0.3) để đảm bảo liên quan
-        relevant_indices = np.where(similarity_scores >= 0.1)[0]
+        # Lọc các sách có độ tương đồng cơ bản (>= 0.2)
+        relevant_indices = np.where(similarity_scores >= 0.2)[0]
         if len(relevant_indices) == 0:
-            logger.debug(f"No books with basic relevance (>= 0.1) for '{query}'")
+            logger.debug(f"No books with basic relevance (>= 0.2) for '{query}'")
             return pd.DataFrame()
 
-        # Lấy chỉ số có độ tương đồng >= 90% từ các sách liên quan
+        # Lọc theo published_year nếu query là số
+        try:
+            year_value = int(query)
+            year_indices = books_df.index[books_df['published_year'] == year_value].tolist()
+            relevant_indices = np.intersect1d(relevant_indices, year_indices) if year_indices else relevant_indices
+            logger.debug(f"Filtered by year {year_value}: {len(relevant_indices)} matches")
+        except ValueError:
+            logger.debug(f"Query '{query}' is not a year, skipping year filter")
+
+        # Lấy chỉ số có độ tương đồng >= 0.9 từ các sách liên quan
         high_similarity_indices = np.intersect1d(relevant_indices, np.where(similarity_scores >= 0.9)[0])
         logger.debug(f"TF-IDF high similarity scores for '{query}': {len(high_similarity_indices)} matches above 0.9")
         if len(high_similarity_indices) > 0:
@@ -236,14 +275,39 @@ def display_book_details(books_df, similarity_matrix):
             st.write(f"**Số lượt đánh giá:** {int(book.get('ratings_count', 0))}")
         st.subheader("📚 Sách tương tự")
         try:
-            idx = books_df[books_df['title'] == book['title']].index[0]
-            similar_indices = similarity_matrix[idx].argsort()[::-1][1:6]  # 5 sách tương tự
-            similar_books = books_df.iloc[similar_indices]
-            for _, similar_book in similar_books.iterrows():
-                st.write(f"- {similar_book['title']}")
+            # Kiểm tra xem tiêu đề có tồn tại trong books_df
+            matching_books = books_df[books_df['title'].str.lower() == book['title'].lower()]  # So sánh không phân biệt chữ cái
+            if matching_books.empty:
+                logger.error(f"No matching book found for title: {book['title']}")
+                st.write("Không thể tìm thấy sách này trong dữ liệu.")
+            else:
+                idx = matching_books.index[0]
+                logger.debug(f"Found index for {book['title']}: {idx}, books_df length: {len(books_df)}")
+                if similarity_matrix is not None and 0 <= idx < similarity_matrix.shape[0]:
+                    similar_scores = similarity_matrix[idx]
+                    if np.any(np.isnan(similar_scores)):  # Kiểm tra NaN
+                        logger.error(f"NaN values found in similarity scores for index {idx}")
+                        st.write("Không thể tải sách tương tự do dữ liệu ma trận không hợp lệ.")
+                    else:
+                        similar_indices = similar_scores.argsort()[::-1][1:6]  # 5 sách tương tự, bỏ qua chính nó
+                        if len(similar_indices) > 0 and all(0 <= i < len(books_df) for i in similar_indices):
+                            similar_books = books_df.iloc[similar_indices]
+                            if not similar_books.empty:
+                                for _, similar_book in similar_books.iterrows():
+                                    st.write(f"- {similar_book['title']}")
+                            else:
+                                logger.warning(f"No valid similar books found for index {idx}")
+                                st.write("Không tìm thấy sách tương tự hợp lệ.")
+                        else:
+                            logger.warning(f"Similar indices out of range for index {idx}")
+                            st.write("Không tìm thấy sách tương tự do chỉ số không hợp lệ.")
+                else:
+                    logger.error(f"Similarity matrix issue: idx={idx}, matrix shape={similarity_matrix.shape if similarity_matrix is not None else 'None'}, books_df length={len(books_df)}")
+                    st.write("Không thể tải sách tương tự do lỗi ma trận tương đồng.")
         except Exception as e:
             logger.error(f"Error getting similar books: {e}")
-            st.write("Không thể tải sách tương tự.")
+            st.write(f"Không thể tải sách tương tự do lỗi: {str(e)}")
+
         if st.button("🔙 Đóng"):
             logger.debug(f"Closing details for book: {book['title']}")
             st.session_state.selected_book = None
